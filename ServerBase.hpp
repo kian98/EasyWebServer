@@ -10,6 +10,7 @@
 #include <map>
 #include <unordered_map>
 #include <regex>
+#include <thread>
 
 #include "boost/asio.hpp"
 
@@ -77,8 +78,12 @@ namespace EasyWeb{
         // 不同socket type需要有不同的实现，因此设置为虚函数
         virtual void accept(){ };
 
+        // 解析请求的信息
+        Request parse_request(std::istream& istream) const;
         // 处理请求和应答，这部分与socket type无关，因此放到基类中实现
         void process_request_and_reponse(std::shared_ptr<socket_type> socket) const;
+
+        void respond(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request) const;
 
         // 所有的资源及默认资源都会在 vector 尾部添加, 并在 start() 中创建
         std::vector<resource_type::iterator> all_resources;
@@ -88,6 +93,128 @@ namespace EasyWeb{
         std::vector<std::thread> threads;
     };
 
+    template<typename socket_type>
+    void ServerBase<socket_type>::start() {
+        // 默认资源放在 vector 的末尾, 用作默认应答
+        for(auto iter=resource.begin(); iter!= resource.end();++iter){
+            all_resources.push_back(iter);
+        }
+        for(auto iter=default_resource.begin(); iter!= default_resource.end();++iter){
+            all_resources.push_back(iter);
+        }
+
+        //调用accept()方式
+        accept();
+
+        // 运行线程,若为多线程，则运行n-1个线程
+        for(size_t n = 1; n < num_threads; ++ n){
+            // emplace_back() 在实现时，则是直接在容器尾部创建这个元素，省去了拷贝或移动元素的过程
+            threads.emplace_back([this](){
+                m_io_service.run();
+            })
+        }
+
+        // 运行主线程
+        m_io_service.run();
+        // 添加其他线程
+        for (auto & t : threads){
+            t.join();
+        }
+
+    }
+
+    template<typename socket_type>
+    Request ServerBase<socket_type>::parse_request(std::istream &istream) const {
+        Request request;
+
+        // 用于解析请求方法(GET/POST)、请求路径以及 HTTP 版本
+        // 即每个请求报文的第一行，method path version
+        // 第一个^为正则表达式的开始，$为结束，(expr)表示expr子模式，[^x]表示匹配除了x之外的字符，*表示多个
+        std::regex e("^([^ ]*) ([^ ]*) HTTP/([^ ]*)$");
+        std::smatch sub_match;
+
+        // 按行解析
+        std::string line;
+        // 从istream中获取第一行，并删除string容器中的最后一个空白符号
+        getline(istream, line);
+        line.pop_back();
+        if(std::regex_match(line, sub_match, e)){
+            request.method = sub_match[1];
+            request.path = sub_match[2];
+            request.http_version = sub_match[3];
+
+            // 继续解析Request Header剩余部分
+            bool matched;
+            // header信息
+            e = "^([^:]*) ?(.*)$";
+            do{
+                getline(istream, line);
+                line.pop_back();
+                matched = std::regex_match(line, sub_match, e);
+                if(matched){
+                    request.header[sub_match[1]] = sub_match[2];
+                }
+            } while (matched);
+        }
+        return request;
+    }
+
+    template<typename socket_type>
+    void ServerBase<socket_type>::process_request_and_reponse(std::shared_ptr<socket_type> socket) const {
+        // 为 async_read_untile() 创建新的读缓存
+        // shared_ptr 用于传递临时对象给匿名函数
+        // auto 会被推导为 std::shared_ptr<boost::asio::streambuf>
+        auto read_buffer = std::make_shared<boost::asio::streambuf>();
+
+        // async_read_until异步读取
+        // 给定一个streambuf和一个分隔符，asio遇到分隔符时返回，
+        // 首先从streambuf中读取请求头的内容（\r\n\r\n为分界）
+        // 接下去读取剩余部分
+        // bytes_transferred是指async_read_until读到分隔符为止的长度
+        // 匿名函数用于读取
+        boost::asio::async_read_until(*socket, *read_buffer, "\r\n\r\n",
+                                      [this, socket, read_buffer](
+                                              const boost::system::error_code& ec,
+                                              size_t bytes_transferred){
+            if (!ec){
+                // stream中接收的总长度
+                size_t total = read_buffer->size();
+
+                // convert from streambuf to istream
+                std::istream stream(read_buffer.get());
+
+                // 首先读取request中的header
+                // request 智能指针指向为Request对象创建的区域
+                auto request = std::make_shared<Request>();
+                // 赋值
+                *request = parse_request(stream);
+
+                size_t num_additional_bytes = total - bytes_transferred;
+                // 判断请求头中指示的请求体内容长度
+                if(request->header.count("Content-Length")>0){
+                    boost::asio::async_read(*socket, *read_buffer);
+                    // read or write until an exact number of bytes has been transferred
+                    boost::asio::transfer_exactly(
+                            stoull(request->header["Content-Length"] - num_additional_bytes),
+                            [this, socket, read_buffer, request](const boost::system::error_code& ec,
+                                    size_t bytes_transferred){
+                                if(!ec){
+                                    request->content = std::make_shared<std::istream>(new std::istream(read_buffer.get()));
+                                    respond(socket, request);
+                                }
+                            });
+                } else{
+                    respond(socket, request);
+                }
+            }
+        })
+
+    }
+
+    template<typename socket_type>
+    void ServerBase<socket_type>::respond(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request) {
+
+    }
 
 }
 

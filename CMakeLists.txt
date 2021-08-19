@@ -9,6 +9,5 @@ if(Boost_FOUND)
     include_directories(${Boost_INCLUDE_DIRS})
     add_executable(EasyWebServer
             main.cpp
-            ServerBase.cpp
             ServerBase.hpp)
 endif()
