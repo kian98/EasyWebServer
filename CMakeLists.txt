@@ -8,6 +8,8 @@ find_package(Boost)
 if(Boost_FOUND)
     include_directories(${Boost_INCLUDE_DIRS})
     add_executable(EasyWebServer
-            main.cpp
-            ServerBase.hpp)
+            main_http.cpp
+            server_base.hpp
+            server_http.hpp
+            handler.hpp)
 endif()

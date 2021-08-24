@@ -48,12 +48,12 @@ namespace EasyWeb{
     template <typename socket_type>
     class ServerBase {
     public:
-        // 构造函数
-        ServerBase(unsigned short port=8820, size_t num_threads=1):
+        // 构造函数若可以只接受一个参数，则需要声明显式explicit，
+        // 因为若有重载，在调用时参数类型可能被编译器隐式转化，导致使用错误的构造函数。
+        explicit ServerBase(unsigned short port=8820, size_t num_threads=1):
         endpoint(boost::asio::ip::tcp::v4(), port),
         acceptor(m_io_service, endpoint),
         num_threads(num_threads) {}
-
 
         // 用于启动服务，设置为public，因为要被调用
         void start();
@@ -81,7 +81,7 @@ namespace EasyWeb{
         // 解析请求的信息
         Request parse_request(std::istream& istream) const;
         // 处理请求和应答，这部分与socket type无关，因此放到基类中实现
-        void process_request_and_reponse(std::shared_ptr<socket_type> socket) const;
+        void process_request_and_respond(std::shared_ptr<socket_type> socket) const;
 
         void respond(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request) const;
 
@@ -111,7 +111,7 @@ namespace EasyWeb{
             // emplace_back() 在实现时，则是直接在容器尾部创建这个元素，省去了拷贝或移动元素的过程
             threads.emplace_back([this](){
                 m_io_service.run();
-            })
+            });
         }
 
         // 运行主线程
@@ -125,6 +125,8 @@ namespace EasyWeb{
 
     template<typename socket_type>
     Request ServerBase<socket_type>::parse_request(std::istream &istream) const {
+//        std::istreambuf_iterator<char> eos;
+//        std::string str(std::istreambuf_iterator<char>(istream), eos);
         Request request;
 
         // 用于解析请求方法(GET/POST)、请求路径以及 HTTP 版本
@@ -137,6 +139,7 @@ namespace EasyWeb{
         std::string line;
         // 从istream中获取第一行，并删除string容器中的最后一个空白符号
         getline(istream, line);
+        std::cout<<line;
         line.pop_back();
         if(std::regex_match(line, sub_match, e)){
             request.method = sub_match[1];
@@ -146,7 +149,7 @@ namespace EasyWeb{
             // 继续解析Request Header剩余部分
             bool matched;
             // header信息
-            e = "^([^:]*) ?(.*)$";
+            e = "^([^:]*): ?(.*)$";
             do{
                 getline(istream, line);
                 line.pop_back();
@@ -154,13 +157,13 @@ namespace EasyWeb{
                 if(matched){
                     request.header[sub_match[1]] = sub_match[2];
                 }
-            } while (matched);
+            } while (matched==true);
         }
         return request;
     }
 
     template<typename socket_type>
-    void ServerBase<socket_type>::process_request_and_reponse(std::shared_ptr<socket_type> socket) const {
+    void ServerBase<socket_type>::process_request_and_respond(std::shared_ptr<socket_type> socket) const {
         // 为 async_read_untile() 创建新的读缓存
         // shared_ptr 用于传递临时对象给匿名函数
         // auto 会被推导为 std::shared_ptr<boost::asio::streambuf>
@@ -192,14 +195,14 @@ namespace EasyWeb{
                 size_t num_additional_bytes = total - bytes_transferred;
                 // 判断请求头中指示的请求体内容长度
                 if(request->header.count("Content-Length")>0){
-                    boost::asio::async_read(*socket, *read_buffer);
+                    boost::asio::async_read(*socket, *read_buffer,
                     // read or write until an exact number of bytes has been transferred
                     boost::asio::transfer_exactly(
-                            stoull(request->header["Content-Length"] - num_additional_bytes),
+                            stoull(request->header["Content-Length"]) - num_additional_bytes),
                             [this, socket, read_buffer, request](const boost::system::error_code& ec,
                                     size_t bytes_transferred){
                                 if(!ec){
-                                    request->content = std::make_shared<std::istream>(new std::istream(read_buffer.get()));
+                                    request->content = std::shared_ptr<std::istream>(new std::istream(read_buffer.get()));
                                     respond(socket, request);
                                 }
                             });
@@ -207,12 +210,38 @@ namespace EasyWeb{
                     respond(socket, request);
                 }
             }
-        })
-
+        });
     }
 
     template<typename socket_type>
-    void ServerBase<socket_type>::respond(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request) {
+    void ServerBase<socket_type>::respond(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request) const{
+        // 对请求路径和方法进行匹配查找，并生成响应
+        for (auto res_iter: all_resources){
+            std::regex e(res_iter->first);
+            std::smatch sm_res;
+            if(std::regex_match(request->path, sm_res, e)){
+                // 若请求路径存在，且有对应的请求方法，则进行响应
+                if(res_iter->second.count(request->method) > 0){
+                    // TODO
+                    // move 右值引用？？？？
+                    request->path_match = move(sm_res);
+                    auto write_buffer = std::make_shared<boost::asio::streambuf>();
+                    std::ostream response(write_buffer.get());
+                    res_iter->second[request->method](response, *request);
+
+                    // ????
+                    boost::asio::async_write(
+                            *socket, *write_buffer,
+                            [this, socket, request, write_buffer]
+                            (const boost::system::error_code& ec, size_t bytes_transferred){
+                                // HTTP 持久连接(HTTP 1.1), 递归调用
+                                if(!ec && stof(request->http_version)>1.05)
+                                    process_request_and_respond(socket);
+                            });
+                    return;
+                }
+            }
+        }
 
     }
 
